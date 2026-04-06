@@ -125,32 +125,111 @@ def build_parser() -> argparse.ArgumentParser:
 # Model helpers
 # ---------------------------------------------------------------------------
 
+def _infer_arch_from_state_dict(sd: dict, fallback: argparse.Namespace) -> dict:
+    """
+    Inspect a raw state_dict and return the architecture hyper-parameters
+    needed to instantiate TSP_net correctly.
+
+    All values are derived from tensor shapes so the script never mis-matches
+    the checkpoint, regardless of the --nb_layers_* / --num_state_encoder
+    flags the user passed.
+
+    Parameters inferred
+    -------------------
+    num_state_encoder        : number of entries in state_encoders ModuleList
+    nb_layers_state_encoder  : MHA layers per state encoder
+    nb_layers_action_encoder : MHA layers in action encoder
+    nb_layers_decoder        : from WK_att_decoder output shape
+    dim_emb                  : from any weight whose dim is a multiple of 128
+    dim_ff                   : from the first FF linear layer in any encoder
+    dim_input_nodes          : from state_encoder input_emb weight shape
+    """
+    keys = list(sd.keys())
+
+    # ---- num_state_encoder: count distinct state_encoders.X.* indices ----
+    import re
+    se_indices = set(
+        int(m.group(1))
+        for k in keys
+        for m in [re.match(r"state_encoders\.(\d+)\.", k)]
+        if m
+    )
+    num_state_encoder = max(se_indices) + 1 if se_indices else fallback.num_state_encoder
+
+    # ---- dim_emb: from WK_att_decoder output width / nb_layers_decoder ----
+    # WK_att_decoder shape: (nb_layers_decoder*dim_emb, (num_state_encoder+1)*dim_emb)
+    wk_key = next((k for k in keys if "WK_att_decoder.weight" in k), None)
+    if wk_key:
+        out_dim, in_dim = sd[wk_key].shape          # out=(nld*de), in=(nse+1)*de
+        # dim_emb divides both; gcd gives the base unit
+        from math import gcd
+        de = gcd(out_dim, in_dim)
+        # Refine: de must also divide (num_state_encoder+1)*de
+        # in_dim = (num_state_encoder+1)*dim_emb  → dim_emb = in_dim/(nse+1)
+        dim_emb = in_dim // (num_state_encoder + 1)
+        nb_layers_decoder = out_dim // dim_emb
+    else:
+        dim_emb           = fallback.dim_emb
+        nb_layers_decoder = fallback.nb_layers_decoder
+
+    # ---- nb_layers_state_encoder: count MHA_layers per state_encoder -----
+    se_mha = set(
+        int(m.group(1))
+        for k in keys
+        for m in [re.match(r"state_encoders\.0\.encoder\.MHA_layers\.(\d+)\.", k)]
+        if m
+    )
+    nb_layers_state_encoder = (max(se_mha) + 1) if se_mha else fallback.nb_layers_state_encoder
+
+    # ---- nb_layers_action_encoder: count MHA_layers in action_encoder ----
+    ae_mha = set(
+        int(m.group(1))
+        for k in keys
+        for m in [re.match(r"action_encoder\.encoder\.MHA_layers\.(\d+)\.", k)]
+        if m
+    )
+    nb_layers_action_encoder = (max(ae_mha) + 1) if ae_mha else fallback.nb_layers_action_encoder
+
+    # ---- dim_ff: from first linear1 in any encoder -----------------------
+    ff_key = next(
+        (k for k in keys if "encoder.linear1_layers.0.weight" in k), None
+    )
+    dim_ff = sd[ff_key].shape[0] if ff_key else fallback.dim_ff
+
+    # ---- dim_input_nodes: from input_emb weight --------------------------
+    inp_key = next(
+        (k for k in keys if "input_emb.weight" in k), None
+    )
+    dim_input_nodes = sd[inp_key].shape[1] if inp_key else fallback.dim_input_nodes
+
+    arch = dict(
+        dim_input_nodes          = dim_input_nodes,
+        dim_emb                  = dim_emb,
+        dim_ff                   = dim_ff,
+        num_state_encoder        = num_state_encoder,
+        nb_layers_state_encoder  = nb_layers_state_encoder,
+        nb_layers_action_encoder = nb_layers_action_encoder,
+        nb_layers_decoder        = nb_layers_decoder,
+        nb_heads                 = fallback.nb_heads,   # not easily inferred
+        batchnorm                = fallback.batchnorm,
+        if_agg_whole_graph       = fallback.if_agg_whole_graph,
+    )
+    return arch
+
+
 def load_model(args, device: torch.device) -> TSP_net:
     """
-    Instantiate TSP_net and load weights from checkpoint.
+    Load a TSP_net from checkpoint, auto-detecting all architecture params
+    from the state_dict so the model always matches the saved weights.
 
     The checkpoint was saved by training_loop.py as:
         {
             'model_baseline': state_dict,
             'model_train':    state_dict,
             'optimizer':      ...,
-            ...
         }
-    We load 'model_baseline' (the EMA / greedy-best model used at test time).
+    We prefer 'model_baseline' (the EMA / greedy-best weights used at test time).
     """
-    model = TSP_net(
-        args.dim_input_nodes,
-        args.dim_emb,
-        args.dim_ff,
-        args.num_state_encoder,
-        args.nb_layers_state_encoder,
-        args.nb_layers_action_encoder,
-        args.nb_layers_decoder,
-        args.nb_heads,
-        batchnorm=args.batchnorm,
-        if_agg_whole_graph=args.if_agg_whole_graph,
-    )
-
     ckpt = torch.load(args.checkpoint, map_location=device)
 
     # Prefer 'model_baseline'; fall back to 'model_train' if absent
@@ -161,13 +240,46 @@ def load_model(args, device: torch.device) -> TSP_net:
             f"Found keys: {list(ckpt.keys())}"
         )
 
+    # Auto-detect architecture from checkpoint weights
+    arch = _infer_arch_from_state_dict(state_dict, fallback=args)
+
+    print(f"[load] checkpoint  : {args.checkpoint}")
+    print(f"[load] architecture detected from checkpoint:")
+    for k, v in arch.items():
+        cli_val = getattr(args, k, "—")
+        flag    = "  ← overrides CLI" if v != cli_val else ""
+        print(f"         {k:30s} = {v}{flag}")
+
+    # Update args so the rest of the script uses the correct state_k size
+    args.num_state_encoder       = arch["num_state_encoder"]
+    args.nb_layers_state_encoder = arch["nb_layers_state_encoder"]
+    args.nb_layers_action_encoder= arch["nb_layers_action_encoder"]
+    args.nb_layers_decoder       = arch["nb_layers_decoder"]
+    args.dim_emb                 = arch["dim_emb"]
+    args.dim_ff                  = arch["dim_ff"]
+    args.dim_input_nodes         = arch["dim_input_nodes"]
+    # Resize state_k to match actual num_state_encoder
+    args.state_k = [35, 50, 65][: args.num_state_encoder]
+
+    model = TSP_net(
+        arch["dim_input_nodes"],
+        arch["dim_emb"],
+        arch["dim_ff"],
+        arch["num_state_encoder"],
+        arch["nb_layers_state_encoder"],
+        arch["nb_layers_action_encoder"],
+        arch["nb_layers_decoder"],
+        arch["nb_heads"],
+        batchnorm=arch["batchnorm"],
+        if_agg_whole_graph=arch["if_agg_whole_graph"],
+    )
+
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
 
-    print(f"[load] checkpoint : {args.checkpoint}")
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[load] parameters : {n_params:,}")
+    print(f"[load] parameters  : {n_params:,}")
     return model
 
 

@@ -1,7 +1,7 @@
-# INViT
-Official Implementation of paper: INViT: A Generalizable Routing Problem Solver with Invariant Nested View Transformer.
-![image](images/INViT.png)
+<!-- # INViT
+Copy of Official Implementation of paper: INViT: A Generalizable Routing Problem Solver with Invariant Nested View Transformer.
 [Paper link](https://arxiv.org/abs/2402.02317)
+
 
 ## Installations
 
@@ -125,4 +125,4 @@ python train.py --problem CVRP --nb_epochs 0 --data_path={} [--] --checkpoint_mo
 ```
 
 Note that before testing the model, the parameter should be consistent with the logs of pretrained checkpoint.
-
+ -->
