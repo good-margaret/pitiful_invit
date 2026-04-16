@@ -181,10 +181,36 @@
 #     run_cvrplib_test_knn(model_baseline,args.action_k,args.state_k)
 
 """
-train.py
+train_rtdl.py
 =============
 Main training script for INViT with optional RTDL reward shaping.
-When rtdl_lambda=0, behaves like standard training.
+Supports training from scratch and fine-tuning from any existing checkpoint.
+ 
+Usage examples
+--------------
+ 
+# ---- Train from scratch, no RTDL (identical to original behaviour) -------
+python train_rtdl.py --nb_nodes 100 --gpu_id 0
+ 
+# ---- Train from scratch WITH RTDL reward shaping ------------------------
+python train_rtdl.py --nb_nodes 100 --gpu_id 0 --use_rtdl --rtdl_lambda 0.1
+ 
+# ---- Fine-tune an existing checkpoint, keep same training settings -------
+python train_rtdl.py --nb_nodes 100 --gpu_id 0 \\
+    --finetune ckpt/tsp/train/model/checkpoint_<stamp>-n100-gpu0.pkl
+ 
+# ---- Fine-tune AND enable RTDL (best of both worlds) ---------------------
+python train_rtdl.py --nb_nodes 100 --gpu_id 0 --use_rtdl --rtdl_lambda 0.1 \\
+    --finetune ckpt/tsp/train/model/checkpoint_<stamp>-n100-gpu0.pkl \\
+    --nb_epochs 50   # fewer epochs for fine-tuning
+ 
+# ---- CVRP, from scratch, no RTDL ----------------------------------------
+python train_rtdl.py --problem cvrp --nb_nodes 50 --gpu_id 0
+ 
+# ---- CPU only (small test run) ------------------------------------------
+python train_rtdl.py --nb_nodes 50 --gpu_id -1 --nb_epochs 5 \\
+    --nb_batch_per_epoch 10 --nb_batch_eval 5 --use_rtdl
+ 
 """
 
 import os
